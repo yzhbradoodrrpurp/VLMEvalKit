@@ -258,12 +258,16 @@ def get_judge_kwargs(dataset_name, dataset_type, args):
     else:
         retry = args.retry
 
+    seed_judge_args = {}
+    if not args.judge_args and os.environ.get('SEED_JUDGE_ARGS'):
+        seed_judge_args = json.loads(os.environ['SEED_JUDGE_ARGS'])
+
     judge_kwargs = {
         'nproc': nproc,
         'verbose': args.verbose,
         'retry': retry,
         'timeout': args.judge_timeout,
-        **(json.loads(args.judge_args) if args.judge_args else {}),
+        **(json.loads(args.judge_args) if args.judge_args else seed_judge_args),
     }
 
     if args.judge_base_url:
@@ -273,6 +277,8 @@ def get_judge_kwargs(dataset_name, dataset_type, args):
 
     if args.judge is not None:
         judge_kwargs['model'] = args.judge
+    elif os.environ.get('SEED_JUDGE_MODEL'):
+        judge_kwargs['model'] = os.environ['SEED_JUDGE_MODEL']
     else:
         if dataset_type in ['MCQ', 'Y/N', 'MCQ_MMMU_Pro'] or listinstr(
             ['moviechat1k', 'mme-reasoning'], dataset_name.lower()
