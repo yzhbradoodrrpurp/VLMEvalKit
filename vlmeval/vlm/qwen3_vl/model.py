@@ -10,6 +10,15 @@ from ..base import BaseModel
 from .prompt import Qwen3VLPromptMixin
 
 VLLM_MAX_IMAGE_INPUT_NUM = 24
+DEFAULT_VLLM_BATCH_SIZE = 128
+DEFAULT_VLLM_MAX_NUM_SEQS = 128
+
+
+def positive_int(value, name: str) -> int:
+    value = int(value)
+    if value < 1:
+        raise ValueError(f'{name} must be a positive integer, got {value}')
+    return value
 
 
 def is_moe_model(model_path: str) -> bool:
@@ -117,6 +126,14 @@ class Qwen3VLChat(Qwen3VLPromptMixin, BaseModel):
 
         self.use_vllm = kwargs.get('use_vllm', False)
         self.use_lmdeploy = kwargs.get('use_lmdeploy', False)
+        self.vllm_batch_size = positive_int(
+            kwargs.get('vllm_batch_size', kwargs.get('batch_size', DEFAULT_VLLM_BATCH_SIZE)),
+            'vllm_batch_size',
+        )
+        self.vllm_max_num_seqs = positive_int(
+            kwargs.get('vllm_max_num_seqs', kwargs.get('max_num_seqs', DEFAULT_VLLM_MAX_NUM_SEQS)),
+            'vllm_max_num_seqs',
+        )
         self.limit_mm_per_prompt = VLLM_MAX_IMAGE_INPUT_NUM
         os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
         assert self.use_vllm + self.use_lmdeploy <= 1, "You can only set one flag `use_vllm` to True"
@@ -127,7 +144,9 @@ class Qwen3VLChat(Qwen3VLPromptMixin, BaseModel):
             gpu_count = torch.cuda.device_count()
             tp_size = gpu_count if gpu_count > 0 else 1
             logging.info(
-                f'Using vLLM for {self.model_path} inference with {tp_size} GPUs (available: {gpu_count})'
+                f'Using vLLM for {self.model_path} inference with {tp_size} GPUs '
+                f'(available: {gpu_count}), batch_size={self.vllm_batch_size}, '
+                f'max_num_seqs={self.vllm_max_num_seqs}'
             )
             if os.environ.get('VLLM_WORKER_MULTIPROC_METHOD') != 'spawn':
                 logging.warning(
@@ -141,7 +160,7 @@ class Qwen3VLChat(Qwen3VLPromptMixin, BaseModel):
                 limit_mm = {"image": self.limit_mm_per_prompt}
             self.llm = LLM(
                 model=self.model_path,
-                max_num_seqs=8,
+                max_num_seqs=self.vllm_max_num_seqs,
                 limit_mm_per_prompt=limit_mm,
                 tensor_parallel_size=tp_size,
                 enable_expert_parallel=enable_expert_parallel,
@@ -341,8 +360,20 @@ class Qwen3VLChat(Qwen3VLPromptMixin, BaseModel):
             print(f'\033[32m{response}\033[0m')
         return response
 
-    def generate_inner_vllm(self, message, dataset=None):
+    def _build_vllm_sampling_params(self):
         from vllm import SamplingParams
+
+        return SamplingParams(
+            temperature=self.temperature,
+            max_tokens=self.max_new_tokens,
+            top_p=self.top_p,
+            top_k=self.top_k,
+            repetition_penalty=self.repetition_penalty,
+            presence_penalty=self.presence_penalty,
+            stop_token_ids=None
+        )
+
+    def _build_vllm_request(self, message, dataset=None):
         is_omni = listinstr(['omni'], self.model_path.lower())
         if is_omni:
             try:
@@ -375,15 +406,6 @@ class Qwen3VLChat(Qwen3VLPromptMixin, BaseModel):
                 return_video_metadata=True,
             )
 
-        sampling_params = SamplingParams(
-            temperature=self.temperature,
-            max_tokens=self.max_new_tokens,
-            top_p=self.top_p,
-            top_k=self.top_k,
-            repetition_penalty=self.repetition_penalty,
-            presence_penalty=self.presence_penalty,
-            stop_token_ids=None
-        )
         mm_data = {}
         if image_inputs is not None:
             mm_data['image'] = image_inputs
@@ -400,11 +422,9 @@ class Qwen3VLChat(Qwen3VLPromptMixin, BaseModel):
         elif video_kwargs is not None:
             req['mm_processor_kwargs'] = video_kwargs
 
-        outputs = self.llm.generate([req], sampling_params=sampling_params)
+        return req
 
-        for o in outputs:
-            generated_text = o.outputs[0].text
-
+    def _post_process_response(self, generated_text):
         if self.post_process:
             resp = generated_text.split('\\boxed{')[-1]
             lt = len(resp)
@@ -422,10 +442,27 @@ class Qwen3VLChat(Qwen3VLPromptMixin, BaseModel):
                     break
             if end is not None:
                 generated_text = resp[:end]
-
-        if self.verbose:
-            print(f'\033[32m{generated_text}\033[0m')
         return generated_text
+
+    def generate_batch(self, messages, dataset=None):
+        if not self.use_vllm:
+            return [self.generate_inner_transformers(message, dataset=dataset) for message in messages]
+
+        if len(messages) == 0:
+            return []
+
+        sampling_params = self._build_vllm_sampling_params()
+        reqs = [self._build_vllm_request(message, dataset=dataset) for message in messages]
+        outputs = self.llm.generate(reqs, sampling_params=sampling_params)
+
+        generated_texts = [self._post_process_response(o.outputs[0].text) for o in outputs]
+        if self.verbose:
+            for generated_text in generated_texts:
+                print(f'\033[32m{generated_text}\033[0m')
+        return generated_texts
+
+    def generate_inner_vllm(self, message, dataset=None):
+        return self.generate_batch([message], dataset=dataset)[0]
 
     def generate_inner(self, message, dataset=None):
         if self.use_vllm:

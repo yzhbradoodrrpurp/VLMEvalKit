@@ -98,6 +98,52 @@ def infer_data_api(model, work_dir, model_name, dataset, index_set=None, api_npr
     return result
 
 
+def build_prompt_for_item(dataset, model, dataset_name, item):
+    if hasattr(dataset, 'force_use_dataset_prompt') and dataset.force_use_dataset_prompt:
+        return dataset.build_prompt(item)
+    if hasattr(model, 'use_custom_prompt') and model.use_custom_prompt(dataset_name):
+        return model.build_prompt(item, dataset=dataset_name)
+    return dataset.build_prompt(item)
+
+
+def get_local_batch_size(model):
+    if not getattr(model, 'use_vllm', False) or not hasattr(model, 'generate_batch'):
+        return 1
+    try:
+        batch_size = int(getattr(model, 'vllm_batch_size', 1))
+    except (TypeError, ValueError):
+        return 1
+    return max(batch_size, 1)
+
+
+def generate_one(model, struct, dataset_name):
+    if os.environ.get('SKIP_ERR', False) == '1':
+        fail_msg = 'Failed to obtain answer'
+        try:
+            return model.generate(message=struct, dataset=dataset_name)
+        except RuntimeError as err:
+            torch.cuda.synchronize()
+            warnings.warn(f'{type(err)} {str(err)}')
+            return f'{fail_msg}: {type(err)} {str(err)}'
+    return model.generate(message=struct, dataset=dataset_name)
+
+
+def generate_local_batch(model, structs, dataset_name):
+    if len(structs) == 1:
+        return [generate_one(model, structs[0], dataset_name)]
+
+    try:
+        return model.generate_batch(structs, dataset=dataset_name)
+    except RuntimeError as err:
+        torch.cuda.synchronize()
+        warnings.warn(
+            f'Batch generation failed with batch_size={len(structs)}: {type(err)} {str(err)}. '
+            'Falling back to single-sample generation for this batch.'
+        )
+        torch.cuda.empty_cache()
+        return [generate_one(model, struct, dataset_name) for struct in structs]
+
+
 def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, api_nproc=4, use_vllm=False,
                retry_failed=True):
     dataset_name = dataset.dataset_name
@@ -164,37 +210,29 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
     else:
         model.set_dump_image(dataset.dump_image)
 
-    for i in tqdm(range(lt), desc=f'Infer {model_name}/{dataset_name}, Rank {rank}/{world_size}'):
-        idx = data.iloc[i]['index']
-        if idx in res:
-            continue
+    batch_size = get_local_batch_size(model)
+    if batch_size > 1:
+        logger.info(f'Use local vLLM batch inference with batch_size={batch_size}.')
 
-        if hasattr(dataset, 'force_use_dataset_prompt') and dataset.force_use_dataset_prompt:
-            struct = dataset.build_prompt(data.iloc[i])
-        elif hasattr(model, 'use_custom_prompt') and model.use_custom_prompt(dataset_name):
-            struct = model.build_prompt(data.iloc[i], dataset=dataset_name)
-        else:
-            struct = dataset.build_prompt(data.iloc[i])
+    pbar = tqdm(total=lt, desc=f'Infer {model_name}/{dataset_name}, Rank {rank}/{world_size}')
+    for start in range(0, lt, batch_size):
+        batch = data.iloc[start:start + batch_size]
+        indices = [x for x in batch['index']]
+        structs = [build_prompt_for_item(dataset, model, dataset_name, batch.iloc[i]) for i in range(len(batch))]
+        responses = generate_local_batch(model, structs, dataset_name)
+        if len(responses) != len(indices):
+            raise RuntimeError(f'Batch generation returned {len(responses)} responses for {len(indices)} inputs.')
 
-        # If `SKIP_ERR` flag is set, the model will skip the generation if error is encountered
-        if os.environ.get('SKIP_ERR', False) == '1':
-            FAIL_MSG = 'Failed to obtain answer'
-            try:
-                response = model.generate(message=struct, dataset=dataset_name)
-            except RuntimeError as err:
-                torch.cuda.synchronize()
-                warnings.warn(f'{type(err)} {str(err)}')
-                response = f'{FAIL_MSG}: {type(err)} {str(err)}'
-        else:
-            response = model.generate(message=struct, dataset=dataset_name)
         torch.cuda.empty_cache()
 
-        if verbose:
-            print(response, flush=True)
+        for idx, response in zip(indices, responses):
+            if verbose:
+                print(response, flush=True)
+            res[idx] = response
 
-        res[idx] = response
-        if (i + 1) % 10 == 0:
-            dump(res, out_file)
+        dump(res, out_file)
+        pbar.update(len(indices))
+    pbar.close()
 
     res = {k: res[k] for k in data_indices}
     dump(res, out_file)
